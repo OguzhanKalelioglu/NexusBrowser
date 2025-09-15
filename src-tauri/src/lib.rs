@@ -10,11 +10,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use rusqlite::{Connection, params};
+use redis::Client as RedisClient;
+use redis::RedisError;
+use redis::cmd;
+use sha2::{Sha256, Digest};
 
 #[derive(Debug, Default)]
 pub struct AppState {
     page_cache: Mutex<HashMap<String, CachedPage>>, // URL -> CachedPage
     tab_ids: Mutex<HashSet<String>>,               // Active webview ids
+    current_urls: Mutex<HashMap<String, String>>,  // tab_id -> current url
+    last_active_tab: Mutex<Option<String>>,        // last focused/used tab id
 }
 
 #[derive(Debug)]
@@ -186,6 +192,126 @@ impl ChatStore {
         conn.execute("DELETE FROM chat_session WHERE url = ?1", params![url])
             .map_err(|e| format!("session silme hatası: {}", e))?;
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct RedisLogger {
+    url: String,
+    stream_key: String,
+}
+
+impl RedisLogger {
+    pub fn from_env() -> Self {
+        // Öncelik sırası: NEXUS_REDIS_URL -> REDIS_URL -> bileşenlerden oluştur
+        let url = std::env::var("NEXUS_REDIS_URL")
+            .ok()
+            .or_else(|| std::env::var("REDIS_URL").ok())
+            .or_else(|| {
+                let host = std::env::var("NEXUS_REDIS_HOST").ok()?;
+                let port = std::env::var("NEXUS_REDIS_PORT").ok().unwrap_or_else(|| "6379".to_string());
+                let password = std::env::var("NEXUS_REDIS_PASSWORD").ok()?;
+                let username = std::env::var("NEXUS_REDIS_USERNAME").ok().unwrap_or_else(|| "default".to_string());
+                Some(format!("rediss://{}:{}@{}:{}", username, password, host, port))
+            })
+            .unwrap_or_default();
+
+        let stream_key = std::env::var("NEXUS_REDIS_STREAM")
+            .unwrap_or_else(|_| "nexus:logs".to_string());
+
+        Self { url, stream_key }
+    }
+
+    pub fn with_url(url: &str) -> Self {
+        Self { url: url.to_string(), stream_key: "nexus:logs".to_string() }
+    }
+
+    pub fn log_json(&self, event: &str, payload: serde_json::Value) {
+        if self.url.is_empty() { return; }
+        let mut obj = match payload {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        obj.insert("event".to_string(), serde_json::Value::String(event.to_string()));
+        obj.insert("ts".to_string(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
+        let json_str = serde_json::Value::Object(obj).to_string();
+
+        let url = self.url.clone();
+        let key = self.stream_key.clone();
+
+        std::thread::spawn(move || {
+            // Bağlantı denemesi helper
+            let do_try = |u: &str| -> Result<(), String> {
+                let client = RedisClient::open(u).map_err(|e| format!("client: {}", e))?;
+                let mut conn = client.get_connection().map_err(|e| format!("conn: {}", e))?;
+                let res: Result<String, RedisError> = cmd("XADD")
+                    .arg(&key)
+                    .arg("*")
+                    .arg("json")
+                    .arg(&json_str)
+                    .query(&mut conn);
+                res.map(|_| ()).map_err(|e| format!("xadd: {}", e))
+            };
+
+            // Aday URL'ler: 1) verilen URL 2) insecure 3) kullanıcı adı olmadan 4) kullanıcı adı olmadan + insecure
+            let mut candidates: Vec<String> = Vec::new();
+            candidates.push(url.clone());
+            let insecure_primary = if url.contains('?') { format!("{}&insecure=true", url) } else { format!("{}?insecure=true", url) };
+            candidates.push(insecure_primary);
+            if let Ok(mut parsed) = url::Url::parse(&url) {
+                let _ = parsed.set_username("");
+                let no_user = parsed.to_string();
+                candidates.push(no_user.clone());
+                let insecure_no_user = if no_user.contains('?') { format!("{}&insecure=true", no_user) } else { format!("{}?insecure=true", no_user) };
+                candidates.push(insecure_no_user);
+            }
+
+            let mut last_err: Option<String> = None;
+            for cand in candidates {
+                match do_try(&cand) {
+                    Ok(_) => { last_err = None; break; }
+                    Err(e) => { warn!("Redis log yazımı başarısız ({}): {}", &cand, e); last_err = Some(e); }
+                }
+            }
+            if let Some(e) = last_err { warn!("Redis log yazımı denemeleri başarısız: {}", e); }
+        });
+    }
+
+    pub fn save_string(&self, key: &str, value: &str, ttl_seconds: Option<usize>) {
+        if self.url.is_empty() { return; }
+        let url = self.url.clone();
+        let key = key.to_string();
+        let val = value.to_string();
+        std::thread::spawn(move || {
+            let do_try = |u: &str| -> Result<(), String> {
+                let client = RedisClient::open(u).map_err(|e| format!("client: {}", e))?;
+                let mut conn = client.get_connection().map_err(|e| format!("conn: {}", e))?;
+                let mut cmd_builder = cmd("SET");
+                cmd_builder.arg(&key).arg(&val);
+                if let Some(ttl) = ttl_seconds { cmd_builder.arg("EX").arg(ttl); }
+                let res: Result<String, RedisError> = cmd_builder.query(&mut conn);
+                res.map(|_| ()).map_err(|e| format!("set: {}", e))
+            };
+            let mut candidates: Vec<String> = Vec::new();
+            candidates.push(url.clone());
+            let insecure_primary = if url.contains('?') { format!("{}&insecure=true", url) } else { format!("{}?insecure=true", url) };
+            candidates.push(insecure_primary);
+            if let Ok(mut parsed) = url::Url::parse(&url) {
+                let _ = parsed.set_username("");
+                let no_user = parsed.to_string();
+                candidates.push(no_user.clone());
+                let insecure_no_user = if no_user.contains('?') { format!("{}&insecure=true", no_user) } else { format!("{}?insecure=true", no_user) };
+                candidates.push(insecure_no_user);
+            }
+            let mut last_err: Option<String> = None;
+            for cand in candidates {
+                match do_try(&cand) {
+                    Ok(_) => { last_err = None; break; }
+                    Err(e) => { warn!("Redis save_string başarısız ({}): {}", &cand, e); last_err = Some(e); }
+                }
+            }
+            if let Some(e) = last_err { warn!("Redis save_string denemeleri başarısız: {}", e); }
+        });
     }
 }
 
@@ -383,43 +509,11 @@ struct OpenRouterModelInfo {
 
 // API anahtarını oku
 fn read_api_key() -> Result<String, String> {
-    // 1) Environment variable takes precedence
-    if let Ok(val) = env::var("FIRECRAWL_API_KEY") {
-        let v = val.trim().to_string();
-        if !v.is_empty() { return Ok(v); }
-    }
-
-    // 2) New multi-key file
-    let keys_path = "/Users/oguzhan/Documents/local_browser/API_KEYS.md";
-    if let Ok(content) = fs::read_to_string(keys_path) {
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("FIRECRAWL_API_KEY=") {
-                let key = rest.trim();
-                if !key.is_empty() { return Ok(key.to_string()); }
-            }
-        }
-    }
-
-    // 3) Backward compatibility: legacy single-key file
-    let legacy_path = "/Users/oguzhan/Documents/local_browser/API_KEY.md";
-    if let Ok(content) = fs::read_to_string(legacy_path) {
-        let key = content.trim().to_string();
-        if !key.is_empty() { return Ok(key); }
-    }
-
-    Err("FIRECRAWL_API_KEY bulunamadı: Lütfen ortam değişkenini ayarlayın ya da API_KEYS.md / API_KEY.md dosyalarını oluşturun.".to_string())
+    Ok("fc-4d73624123e2456396d20be0a85c6850".to_string())
 }
 
 fn read_openrouter_api_key() -> Result<String, String> {
-    let path = "/Users/oguzhan/Documents/local_browser/API_KEYS.md";
-    let content = fs::read_to_string(path).map_err(|e| format!("OpenRouter anahtarı okunamadı: {}", e))?;
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("OPEN_ROUTER_API_KEY=") {
-            let key = rest.trim();
-            if !key.is_empty() { return Ok(key.to_string()); }
-        }
-    }
-    Err("OPEN_ROUTER_API_KEY bulunamadı".to_string())
+    Ok("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".to_string())
 }
 
 // Ollama modellerini getir
@@ -1227,16 +1321,11 @@ async fn query_openrouter_with_content(window: tauri::Window, content: String, q
     let api_key = read_openrouter_api_key()?;
     let client = reqwest::Client::new();
 
-    // Kaliteli free modeller (güncel OpenRouter listesi)
+    // Kaliteli free modeller (güncel OpenRouter listesi) - en güçlüler en üstte
     let preferred_free_models = vec![
-        // Gemma 3 serisi (büyükten küçüğe)
-        "google/gemma-3-27b-it:free",  // En güçlü
-        "google/gemma-3-12b-it:free", 
-        "google/gemma-3-4b-it:free",
-        "google/gemma-3n-e2b-it:free",
-        // Qwen 3 serisi
-        "qwen/qwen3-coder:free",       // Kodlama odaklı
-        "qwen/qwen3-235b-a22b:free",
+        "openai/gpt-oss-20b:free",
+        "openai/gpt-oss-120b:free",
+        "moonshotai/kimi-dev-72b:free"
     ];
 
     // Aday modeller: önce istenen model, sonra kaliteli free modeller, sonra diğerleri
@@ -1405,8 +1494,19 @@ async fn query_openrouter_with_content(window: tauri::Window, content: String, q
 
 // Ana soru sorma komutu
 #[tauri::command]
-async fn ask_question(window: tauri::Window, state: tauri::State<'_, AppState>, store: tauri::State<'_, ChatStore>, url: String, question: String, model: String) -> Result<(), String> {
-    info!("'ask_question' komutu başlatıldı. URL: {}", url);
+async fn ask_question(window: tauri::Window, state: tauri::State<'_, AppState>, store: tauri::State<'_, ChatStore>, logger: tauri::State<'_, RedisLogger>, mut url: String, question: String, model: String) -> Result<(), String> {
+    // Her zaman aktif sekmenin güncel URL'ini prefer et
+    let original_url = url.clone();
+    let mut effective_url: Option<String> = None;
+    if let Ok(last) = state.last_active_tab.lock() {
+        if let Some(tab) = &*last {
+            if let Ok(map) = state.current_urls.lock() {
+                effective_url = map.get(tab).cloned();
+            }
+        }
+    }
+    if let Some(u) = effective_url { url = u; }
+    info!("'ask_question' komutu başlatıldı. URL: {} (orijinal: {})", url, original_url);
 
     // Cache kontrolü
     let ttl = Duration::from_secs(300); // 5 dakika TTL
@@ -1468,27 +1568,86 @@ async fn ask_question(window: tauri::Window, state: tauri::State<'_, AppState>, 
         })
     ).ok();
 
+    // Redis: scraping sonucu logu + içerik blob kaydı
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let sha = hasher.finalize();
+    let sha_hex = hex::encode(sha);
+    let content_key = format!("nexus:content:{}", sha_hex);
+    logger.save_string(&content_key, &content, Some(60 * 60)); // 1 saat TTL
+    logger.log_json("scrape_result", serde_json::json!({
+        "mode": "ollama",
+        "url": url,
+        "source": source_label,
+        "from_cache": from_cache,
+        "content_length": content.len(),
+        "content_key": content_key,
+        "content_sha256": sha_hex,
+        "content_preview": content
+    }));
+
     // Son 10 mesajı geçmiş olarak topla (role-based kullanacağız)
     let session_id = store.upsert_session(&url)?;
     let history_pairs = store.get_messages(session_id, 10)?; // (role, content)
     // Adım 2: Ollama'ya sor (stream olarak) ve nihai cevabı al
-    let assistant_text = query_ollama_with_content(window, &store, content, question.clone(), model, history_pairs).await?;
+    let assistant_text = query_ollama_with_content(window.clone(), &store, content.clone(), question.clone(), model.clone(), history_pairs).await?;
 
     // Mesajları DB'ye kaydet
     store.add_message(session_id, "user", &question)?;
     store.add_message(session_id, "assistant", &assistant_text)?;
 
+    // Redis: model cevabı logu
+    logger.log_json("model_answer", serde_json::json!({
+        "mode": "ollama",
+        "url": url,
+        "model": model,
+        "answer_preview": &assistant_text[..assistant_text.len().min(1000)],
+        "content_source": source_label
+    }));
+
     Ok(())
 }
 
 fn read_instruction() -> String {
-    let path = "/Users/oguzhan/Documents/local_browser/Instruction.md";
-    fs::read_to_string(path).unwrap_or_default()
+    // Proje build edildiğinde dışarıdan dosya okuma sorunlarını önlemek için talimatları doğrudan koda gömüyoruz.
+    r#"
+# Rol ve Amaç
+Nexus Browser adlı bir tarayıcıda çalışan bir Yapay Zeka Web Tarayıcısısın. Amacın, kullanıcıların ziyaret ettiği web sayfalarından veri analiz etmek ve bu verilere dayanarak kullanıcının siteyle ilgili sorduğu sorulara mümkün olduğunca doğru ve kapsamlı cevaplar sunmaktır.
+
+# Talimatlar
+- Kullanıcı aynı web sitesiyle ilgili başka bir soru sorduğunda, tekrar veri çekmene gerek yoktur. Önbellekteki (cache) mevcut veriyi incelemeye devam edebilirsin.
+- Her zaman önce sana sağlanan sayfa içeriğini referans al.
+- Kaynak sayfadan alıntı yaparken bilgileri özetle ve açık, net ifadeler kullan.
+- Bilinmeyen konularda varsayımda bulunma, "bilmiyorum" demekten çekinme.
+- Cevaplarını, sana sunulan metne sadık kalarak detaylı, bilgilendirici ve kapsamlı bir şekilde oluştur.
+
+İşlem sırasında aşağıdaki ilkelere uy:
+- Yanıtlarında yalnızca genel ve güvenli bilgiler sun; özel veya kişisel bilgiler (PII) içeren içerikleri yanıtlama.
+- Kullanıcıya sorduğu soruyla ilgili olabildiğince detaylı cevap ver.
+
+Kullanıcı chat alanına aşağıdaki gibi komutlar yazarsa, cevap stilini ona göre ayarla:
+- /ozetle — Websitesi verilerini kısa özetle
+- /acikla — Websitesi verilerini detaylı açıkla
+- /madde — Websitesi verilerini maddeler halinde yaz
+- /kaynakekle — Websitesindeki kaynakları belirt
+- /kisalt — Önceki cevabını daha kısa yaz
+- /uzat — Önceki cevabını daha detaylı yaz
+"#.to_string()
 }
 
 #[tauri::command]
-async fn ask_question_openrouter(window: tauri::Window, state: tauri::State<'_, AppState>, store: tauri::State<'_, ChatStore>, url: String, question: String, model: String) -> Result<(), String> {
-    info!("'ask_question_openrouter' komutu başlatıldı. URL: {} | model: {}", url, model);
+async fn ask_question_openrouter(window: tauri::Window, state: tauri::State<'_, AppState>, store: tauri::State<'_, ChatStore>, logger: tauri::State<'_, RedisLogger>, mut url: String, question: String, model: String) -> Result<(), String> {
+    let original_url = url.clone();
+    let mut effective_url: Option<String> = None;
+    if let Ok(last) = state.last_active_tab.lock() {
+        if let Some(tab) = &*last {
+            if let Ok(map) = state.current_urls.lock() {
+                effective_url = map.get(tab).cloned();
+            }
+        }
+    }
+    if let Some(u) = effective_url { url = u; }
+    info!("'ask_question_openrouter' komutu başlatıldı. URL: {} (orijinal: {}) | model: {}", url, original_url, model);
     // Cache/scrape aynı mantık
     let ttl = Duration::from_secs(300);
     let mut use_cached = false;
@@ -1541,13 +1700,40 @@ async fn ask_question_openrouter(window: tauri::Window, state: tauri::State<'_, 
         })
     ).ok();
 
+    // Redis: scraping sonucu logu + içerik blob kaydı
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let sha = hasher.finalize();
+    let sha_hex = hex::encode(sha);
+    let content_key = format!("nexus:content:{}", sha_hex);
+    logger.save_string(&content_key, &content, Some(60 * 60)); // 1 saat TTL
+    logger.log_json("scrape_result", serde_json::json!({
+        "mode": "openrouter",
+        "url": url,
+        "source": source_label,
+        "from_cache": from_cache,
+        "content_length": content.len(),
+        "content_key": content_key,
+        "content_sha256": sha_hex,
+        "content_preview": content
+    }));
+
     let system_prompt = read_instruction();
-    let assistant_text = query_openrouter_with_content(window.clone(), content, question.clone(), model.clone(), system_prompt).await?;
+    let assistant_text = query_openrouter_with_content(window.clone(), content.clone(), question.clone(), model.clone(), system_prompt).await?;
 
     // Mesajları DB'ye kaydet (Ollama ile aynı mantık)
     let session_id = store.upsert_session(&url)?;
     store.add_message(session_id, "user", &question)?;
     store.add_message(session_id, "assistant", &assistant_text)?;
+
+    // Redis: model cevabı logu
+    logger.log_json("model_answer", serde_json::json!({
+        "mode": "openrouter",
+        "url": url,
+        "model": model,
+        "answer_preview": &assistant_text[..assistant_text.len().min(1000)],
+        "content_source": source_label
+    }));
     Ok(())
 }
 
@@ -1592,6 +1778,7 @@ async fn show_only_tab(window: tauri::Window, state: tauri::State<'_, AppState>,
             else { webview.hide().map_err(|e| e.to_string())?; }
         }
     }
+    if let Ok(mut last) = state.last_active_tab.lock() { *last = Some(tab_id); }
     Ok(())
 }
 
@@ -1614,89 +1801,134 @@ async fn open_in_browser(mut url: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn open_or_navigate_browser_tab(window: tauri::Window, state: tauri::State<'_, AppState>, tab_id: String, url: String) -> Result<(), String> {
+    // 1) Varsa mevcut webview'i yeniden kullan
     if let Some(existing) = window.get_webview(&tab_id) {
         let js_command = format!("window.location.href = '{}'", &url);
         existing.eval(&js_command).map_err(|e| e.to_string())?;
-        
-        // Mevcut webview için de URL monitoring inject et
+
         let monitor_js = format!(r#"
             (function() {{
                 let currentUrl = window.location.href;
                 const tabId = '{}';
-                
                 function checkUrl() {{
                     if (window.location.href !== currentUrl) {{
                         currentUrl = window.location.href;
-                        window.__TAURI__.core.invoke('notify_url_change', {{
-                            tabId: tabId,
-                            url: currentUrl
-                        }}).catch(console.error);
+                        window.__TAURI__.core.invoke('notify_url_change', {{ tabId: tabId, url: currentUrl }}).catch(console.error);
                     }}
                 }}
-                
                 setInterval(checkUrl, 500);
                 window.addEventListener('popstate', checkUrl);
-                
                 setTimeout(() => {{
-                    window.__TAURI__.core.invoke('notify_url_change', {{
-                        tabId: tabId,
-                        url: currentUrl
-                    }}).catch(console.error);
+                    window.__TAURI__.core.invoke('notify_url_change', {{ tabId: tabId, url: currentUrl }}).catch(console.error);
                 }}, 1000);
             }})();
         "#, tab_id);
-        
         existing.eval(&monitor_js).map_err(|e| e.to_string())?;
-    } else {
-        let parsed = tauri::Url::parse(&url).map_err(|e| format!("URL parse hatası: {}", e))?;
-        let builder = WebviewBuilder::new(&tab_id, tauri::WebviewUrl::External(parsed));
-        let webview = window
-            .add_child(
-                builder,
-                tauri::LogicalPosition::new(0.0, 0.0),
-                tauri::LogicalSize::new(1.0, 1.0),
-            )
-            .map_err(|e| format!("Child webview oluşturulamadı: {}", e))?;
-        
-        // URL değişikliklerini yakalamak için JavaScript inject et
-        let monitor_js = format!(r#"
-            (function() {{
-                let currentUrl = window.location.href;
-                const tabId = '{}';
-                
-                function checkUrl() {{
-                    if (window.location.href !== currentUrl) {{
-                        currentUrl = window.location.href;
-                        // Tauri'ye URL değişikliği bildir
-                        window.__TAURI__.core.invoke('notify_url_change', {{
-                            tabId: tabId,
-                            url: currentUrl
-                        }}).catch(console.error);
-                    }}
-                }}
-                
-                // Her 500ms URL kontrolü yap
-                setInterval(checkUrl, 500);
-                
-                // popstate eventi ile browser back/forward yakala
-                window.addEventListener('popstate', checkUrl);
-                
-                // İlk URL'i bildir
-                setTimeout(() => {{
-                    window.__TAURI__.core.invoke('notify_url_change', {{
-                        tabId: tabId,
-                        url: currentUrl
-                    }}).catch(console.error);
-                }}, 1000);
-            }})();
-        "#, tab_id);
-        
-        // JavaScript'i webview'e inject et
-        webview.eval(&monitor_js).map_err(|e| format!("JavaScript inject hatası: {}", e))?;
-        
-        if let Ok(mut set) = state.tab_ids.lock() { set.insert(tab_id.clone()); }
+        // State: aktif sekme ve URL'i güncelle
+        if let Ok(mut last) = state.last_active_tab.lock() { *last = Some(tab_id.clone()); }
+        if let Ok(mut map) = state.current_urls.lock() { map.insert(tab_id.clone(), url.clone()); }
+        return Ok(());
     }
-    Ok(())
+
+    // 2) Yarış koşullarını engellemek için oluşturma guard'ı kullan
+    let already_in_set = {
+        let mut set = state.tab_ids.lock().map_err(|_| "tab set lock".to_string())?;
+        if set.contains(&tab_id) { true } else { set.insert(tab_id.clone()); false }
+    };
+
+    if already_in_set {
+        // Muhtemelen başka bir görev oluşturuyor; kısa bir süre bekle ve tekrar dene
+        for _ in 0..10 {
+            if let Some(existing) = window.get_webview(&tab_id) {
+                let js_command = format!("window.location.href = '{}'", &url);
+                existing.eval(&js_command).map_err(|e| e.to_string())?;
+                let monitor_js = format!(r#"
+                    (function() {{
+                        let currentUrl = window.location.href;
+                        const tabId = '{}';
+                        function checkUrl() {{
+                            if (window.location.href !== currentUrl) {{
+                                currentUrl = window.location.href;
+                                window.__TAURI__.core.invoke('notify_url_change', {{ tabId: tabId, url: currentUrl }}).catch(console.error);
+                            }}
+                        }}
+                        setInterval(checkUrl, 500);
+                        window.addEventListener('popstate', checkUrl);
+                        setTimeout(() => {{
+                            window.__TAURI__.core.invoke('notify_url_change', {{ tabId: tabId, url: currentUrl }}).catch(console.error);
+                        }}, 1000);
+                    }})();
+                "#, tab_id);
+                existing.eval(&monitor_js).map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Hala yoksa, aşağıda oluşturmayı dene
+    }
+
+    // 3) Yeni webview oluştur
+    let parsed = tauri::Url::parse(&url).map_err(|e| format!("URL parse hatası: {}", e))?;
+    let builder = WebviewBuilder::new(&tab_id, tauri::WebviewUrl::External(parsed));
+    match window.add_child(
+        builder,
+        tauri::LogicalPosition::new(0.0, 0.0),
+        tauri::LogicalSize::new(1.0, 1.0),
+    ) {
+        Ok(webview) => {
+            let monitor_js = format!(r#"
+                (function() {{
+                    let currentUrl = window.location.href;
+                    const tabId = '{}';
+                    function checkUrl() {{
+                        if (window.location.href !== currentUrl) {{
+                            currentUrl = window.location.href;
+                            window.__TAURI__.core.invoke('notify_url_change', {{ tabId: tabId, url: currentUrl }}).catch(console.error);
+                        }}
+                    }}
+                    setInterval(checkUrl, 500);
+                    window.addEventListener('popstate', checkUrl);
+                    setTimeout(() => {{
+                        window.__TAURI__.core.invoke('notify_url_change', {{ tabId: tabId, url: currentUrl }}).catch(console.error);
+                    }}, 1000);
+                }})();
+            "#, tab_id);
+            webview.eval(&monitor_js).map_err(|e| format!("JavaScript inject hatası: {}", e))?;
+            // State: aktif sekme ve URL'i güncelle
+            if let Ok(mut last) = state.last_active_tab.lock() { *last = Some(tab_id.clone()); }
+            if let Ok(mut map) = state.current_urls.lock() { map.insert(tab_id.clone(), url.clone()); }
+            Ok(())
+        }
+        Err(e) => {
+            // Oluşturma başarısız: guard'ı geri al ve eğer arada oluştuysa onu kullan
+            if let Ok(mut set) = state.tab_ids.lock() { set.remove(&tab_id); }
+            if let Some(existing) = window.get_webview(&tab_id) {
+                let js_command = format!("window.location.href = '{}'", &url);
+                existing.eval(&js_command).map_err(|e| e.to_string())?;
+                let monitor_js = format!(r#"
+                    (function() {{
+                        let currentUrl = window.location.href;
+                        const tabId = '{}';
+                        function checkUrl() {{
+                            if (window.location.href !== currentUrl) {{
+                                currentUrl = window.location.href;
+                                window.__TAURI__.core.invoke('notify_url_change', {{ tabId: tabId, url: currentUrl }}).catch(console.error);
+                            }}
+                        }}
+                        setInterval(checkUrl, 500);
+                        window.addEventListener('popstate', checkUrl);
+                        setTimeout(() => {{
+                            window.__TAURI__.core.invoke('notify_url_change', {{ tabId: tabId, url: currentUrl }}).catch(console.error);
+                        }}, 1000);
+                    }})();
+                "#, tab_id);
+                existing.eval(&monitor_js).map_err(|e| e.to_string())?;
+                Ok(())
+            } else {
+                Err(format!("Child webview oluşturulamadı: {}", e))
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -1740,12 +1972,17 @@ async fn load_chat_messages(state: tauri::State<'_, ChatStore>, url: String, lim
 }
 
 #[tauri::command]
-async fn notify_url_change(window: tauri::Window, tab_id: String, url: String) -> Result<(), String> {
+#[allow(non_snake_case)]
+async fn notify_url_change(window: tauri::Window, state: tauri::State<'_, AppState>, tabId: String, url: String) -> Result<(), String> {
     // Frontend'e URL değişikliği bildir
     window.emit("webview-navigation", serde_json::json!({
-        "tabId": tab_id,
+        "tabId": tabId,
         "url": url
     })).map_err(|e| e.to_string())?;
+    // Backend state'e güncel URL'i yaz
+    if let Ok(mut map) = state.current_urls.lock() { map.insert(tabId.clone(), url.clone()); }
+    if let Ok(mut last) = state.last_active_tab.lock() { *last = Some(tabId.clone()); }
+    info!("URL değişti: tab={} url={} ", tabId, url);
     Ok(())
 }
 
@@ -1843,9 +2080,15 @@ pub fn run() {
     let store = ChatStore::new("chat.db").expect("chat db başlatılamadı");
     let _ = store.clear_all();
 
+    // Redis logger'ı sabit URL ile başlat (TLS - rediss)
+    let redis_logger = RedisLogger::with_url(
+        "redis://default:z4sLzsAMiOQgeD7jbpEvs1lPDPHdVxXI@redis-10386.crce175.eu-north-1-1.ec2.redns.redis-cloud.com:10386"
+    );
+
     tauri::Builder::default()
         .manage(AppState::default())
         .manage(store)
+        .manage(redis_logger)
         .invoke_handler(tauri::generate_handler![
             get_ollama_models,
             get_openrouter_models,
@@ -1872,6 +2115,36 @@ pub fn run() {
             get_page_info,
             notify_url_change
         ])
+        .on_page_load(|window, payload| {
+            let tab_id = window.label().to_string();
+            let url = payload.url();
+            
+            // Notify frontend and backend about the URL change
+            let _ = window.emit("webview-navigation", serde_json::json!({ "tabId": &tab_id, "url": url }));
+            if let Some(state) = window.try_state::<AppState>() {
+                 if let Ok(mut map) = state.current_urls.lock() { map.insert(tab_id.clone(), url.to_string()); }
+                 if let Ok(mut last) = state.last_active_tab.lock() { *last = Some(tab_id.clone()); }
+            }
+
+            // Re-inject the URL monitoring script
+            let monitor_js = format!(r#"
+                (function() {{
+                    if (window.__url_monitor_injected) return;
+                    window.__url_monitor_injected = true;
+                    let currentUrl = '{}';
+                    const tabId = '{}';
+                    function checkUrl() {{
+                        if (window.location.href !== currentUrl) {{
+                            currentUrl = window.location.href;
+                            try {{ window.__TAURI__.core.invoke('notify_url_change', {{ tabId: tabId, url: currentUrl }}); }} catch (e) {{ console.error(e); }}
+                        }}
+                    }}
+                    setInterval(checkUrl, 500);
+                    window.addEventListener('popstate', checkUrl);
+                }})();
+            "#, url, tab_id);
+            let _ = window.eval(&monitor_js);
+        })
         .setup(|app| {
             // Devtools otomatik açma kaldırıldı. Option+Cmd+I ile aç/kapat.
 

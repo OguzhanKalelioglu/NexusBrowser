@@ -30,3 +30,7 @@ futures = "0.3.31"
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = "0.4.42"
 url = "2.5"
+redis = { version = "0.25", default-features = false }
+dotenvy = "0.15"
+sha2 = "0.10"
+hex = "0.4"

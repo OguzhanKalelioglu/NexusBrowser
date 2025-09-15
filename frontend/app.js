@@ -1336,7 +1336,7 @@ function updateModelSelector() {
     } else {
         // ONLINE mod: model seçici tamamen gizli
         modelSelectorEl.classList.remove('visible');
-        state.currentModel = 'openrouter:google/gemini-2.0-flash-exp:free';
+        state.currentModel = 'deepseek/deepseek-chat-v3.1:free';
     }
 }
 
@@ -1472,7 +1472,7 @@ async function handleChatSubmit() {
             });
         } else {
             // OpenRouter kullan (varsayılan)
-            const model = state.currentModel ? state.currentModel.replace('openrouter:', '') : 'google/gemini-2.0-flash-exp:free';
+            const model = state.currentModel ? state.currentModel.replace('openrouter:', '') : 'mistralai/mixtral-8x7b-instruct:free';
             await tauriInvoke('ask_question_openrouter', {
                 url: state.currentUrl,
                 question: buildQuestionWithDirective(clean, directive),
