@@ -1,0 +1,28 @@
+# Node.js
+node_modules/
+dist/
+.env
+.env*.local
+npm-debug.log*
+yarn-error.log
+
+# Tauri / Rust
+/src-tauri/target/
+/src-tauri/gen/
+/src-tauri/Cargo.lock
+
+# Veritabanı dosyaları
+*.db
+*.db-journal
+chat.db
+
+# Hassas Bilgiler
+API_KEYS.md
+
+# İşletim Sistemi dosyaları
+.DS_Store
+Thumbs.db
+
+# IDE klasörleri
+.vscode/
+.idea/

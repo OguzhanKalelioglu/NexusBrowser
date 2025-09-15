@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nexus Browser</title>
+    <link rel="icon" type="image/svg+xml" href="../src-tauri/icons/icon.svg" />
+    <link rel="stylesheet" href="styles.css">
+    <!-- Font Awesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+</head>
+<body>
+    <div id="app">
+        <!-- Top Navigation Bar -->
+        <div class="top-bar">
+            <!-- Tabs Section (Top Row) -->
+            <div class="tabs-bar">
+                <div id="tabs-container" class="tabs-container"></div>
+                <button id="new-tab-btn" class="tab-new" title="Yeni sekme (Ctrl/Cmd+T)">+</button>
+            </div>
+            
+            <!-- Navigation Controls (Bottom Row) -->
+            <div class="navigation-row">
+                <div class="nav-buttons">
+                    <button id="back-btn" class="nav-btn" title="Geri">
+                        <i class="fas fa-arrow-left"></i>
+                    </button>
+                    <button id="forward-btn" class="nav-btn" title="İleri">
+                        <i class="fas fa-arrow-right"></i>
+                    </button>
+                    <button id="refresh-btn" class="nav-btn" title="Yenile">
+                        <i class="fas fa-redo"></i>
+                    </button>
+                    <button id="home-btn" class="nav-btn" title="Anasayfa">
+                        <i class="fas fa-home"></i>
+                    </button>
+                </div>
+                
+                <div class="url-bar">
+                    <i class="fas fa-globe url-icon"></i>
+                    <input 
+                        type="text" 
+                        id="url-input" 
+                        placeholder="Web'de arama yapın veya adresi girin"
+                        autocomplete="off"
+                    >
+                    <button id="go-btn" class="go-button">
+                        <i class="fas fa-search"></i>
+                    </button>
+                </div>
+                
+                <div class="top-controls">
+                    <button id="chat-toggle" class="control-btn active" title="Chat Paneli">
+                        <i class="fas fa-comments"></i>
+                    </button>
+                    <div class="mode-toggle" title="Çalışma Modu">
+                        <button id="mode-online" class="seg-btn active">Online</button>
+                        <button id="mode-local" class="seg-btn">Local</button>
+                    </div>
+                    <div class="model-selector">
+                        <div class="select-wrapper">
+                            <i class="fas fa-microchip select-icon"></i>
+                            <select id="model-select" title="AI Model">
+                                <option value="">Model yükleniyor...</option>
+                            </select>
+                            <i class="fas fa-chevron-down select-arrow"></i>
+                        </div>
+                    </div>
+                    <button id="settings-btn" class="control-btn" title="Ayarlar">
+                        <i class="fas fa-ellipsis-v"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Content Area -->
+        <div class="main-content">
+            <!-- Web Browser Panel -->
+            <div class="browser-panel" id="browser-panel">
+                <div class="browser-header">
+                    <div class="browser-status">
+                        <span id="status-indicator" class="status-ready"></span>
+                        <span id="current-url"></span>
+                    </div>
+                </div>
+                
+                <div class="browser-content">
+                    <div id="browser-view-container"></div>
+                    
+                    <!-- Welcome Screen -->
+                    <div id="welcome-screen" class="welcome-screen">
+                        <div class="welcome-content">
+                            <div class="browser-logo">
+                                <img src="../src-tauri/icons/icon.svg" alt="Nexus Browser">
+                                <h1>Nexus Browser</h1>
+                            </div>
+                            
+                            <div class="search-section">
+                                <div class="search-container">
+                                    <i class="fas fa-search search-icon"></i>
+                                    <input type="text" id="homepage-search" placeholder="Web'de arama yapın veya adresi girin" autocomplete="off">
+                                    <button id="homepage-search-btn" class="search-btn">
+                                        <i class="fas fa-arrow-right"></i>
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <div class="quick-sites">
+                                <div style="display:flex;align-items:center;justify-content:space-between;">
+                                    <h3>Popüler Siteler</h3>
+                                    <button id="popular-edit-btn" class="control-btn" title="Siteleri Düzenle"><i class="fas fa-pen"></i></button>
+                                </div>
+                                <div id="popular-sites" class="sites-grid"></div>
+                            </div>
+                            
+                            <div class="browser-features">
+                                <div class="feature-item">
+                                    <i class="fas fa-robot"></i>
+                                    <span>AI ile sohbet edin</span>
+                                </div>
+                                <div class="feature-item">
+                                    <i class="fas fa-shield-alt"></i>
+                                    <span>Güvenli tarama</span>
+                                </div>
+                                <div class="feature-item">
+                                    <i class="fas fa-bolt"></i>
+                                    <span>Hızlı performans</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Chat Panel -->
+            <div class="chat-panel" id="chat-panel">
+                <div class="chat-header">
+                    <div class="chat-title">
+                        <i class="fas fa-robot"></i>
+                        <span>AI Chat</span>
+                    </div>
+                    <div class="chat-controls">
+                        <button id="clear-chat" class="control-btn" title="Sohbeti Temizle">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                        <button id="minimize-chat" class="control-btn" title="Küçült">
+                            <i class="fas fa-minus"></i>
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="chat-messages" id="chat-messages">
+                    <div class="system-message">
+                        <i class="fas fa-info-circle"></i>
+                        <span>Merhaba! Açtığınız web sayfası hakkında soru sorabilirsiniz.</span>
+                    </div>
+                </div>
+                
+                <div class="chat-input-container">
+                    <div class="chat-status" id="chat-status">
+                        <i id="chat-status-spinner" class="fas fa-circle-notch fa-spin" style="display:none;margin-right:6px;color:#94a3b8;"></i>
+                        <span class="status-text">Hazır</span>
+                    </div>
+                    <!-- Slash command suggestions -->
+                    <div id="slash-suggestions" class="slash-suggestions hidden"></div>
+                    <div class="chat-input">
+                        <textarea 
+                            id="message-input" 
+                            placeholder="Web sayfası hakkında sorunuzu yazın..."
+                            rows="2"
+                        ></textarea>
+                        <button id="send-btn" class="send-button" title="Gönder">
+                            <i class="fas fa-paper-plane"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="loading-overlay" class="loading-overlay">
+        <div class="spinner"></div>
+        <div class="loading-text">Yükleniyor...</div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Ayarlar</h3>
+                <button id="settings-close" class="close-btn" title="Kapat"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body">
+                <div class="setting-section">
+                    <label class="field-label">
+                        <input type="checkbox" id="enable-ollama" class="setting-checkbox">
+                        <span>Ollama'yı Etkinleştir (Yerel AI)</span>
+                    </label>
+                    <small class="field-hint">Bilgisayarınızdaki Ollama modellerini kullanın</small>
+                </div>
+                
+                <div id="ollama-settings" class="setting-section" style="display:none;">
+                    <label for="ollama-url" class="field-label">Ollama URL</label>
+                    <input type="text" id="ollama-url" class="field-input" placeholder="http://localhost:11434">
+                    <small class="field-hint">Örn: http://192.168.1.50:11434</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="settings-save" class="primary-btn"><i class="fas fa-save"></i> Kaydet</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Popular Sites Modal -->
+    <div id="popular-modal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Popüler Siteler</h3>
+                <button id="popular-close" class="close-btn" title="Kapat"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body">
+                <div style="margin-bottom:8px; font-size:12px; color: var(--text-secondary);">Sürükleyip bırakarak sıralayın. Satırdaki kalem ve çöp ikonlarıyla düzenleyin.</div>
+                <div id="popular-list" style="margin-bottom:12px;"></div>
+                <hr style="margin:12px 0; border:none; border-top:1px solid var(--border-light);"/>
+                <div>
+                    <input type="hidden" id="popular-id">
+                    <label class="field-label" for="popular-title">Başlık</label>
+                    <input class="field-input" id="popular-title" placeholder="Örn: Google">
+                    <label class="field-label" for="popular-url">URL</label>
+                    <input class="field-input" id="popular-url" placeholder="https://...">
+                    <label class="field-label" for="popular-color">Arkaplan Rengi (hex)</label>
+                    <input class="field-input" id="popular-color" placeholder="#4285F4">
+                    <label class="field-label" for="popular-icon">İkon Sınıfı (FontAwesome)</label>
+                    <input class="field-input" id="popular-icon" placeholder="fab fa-google">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <div style="font-size:12px;color:var(--text-secondary);">Değişiklikler otomatik kaydedilir.</div>
+                <button id="popular-reset" class="control-btn" title="Formu Temizle"><i class="fas fa-eraser"></i></button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
